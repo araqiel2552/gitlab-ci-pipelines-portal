@@ -1,0 +1,303 @@
+@page "/admin/users"
+@attribute [Authorize(Policy = "AdminOnly")]
+@rendermode InteractiveServer
+@inject IDbContextFactory<AppDbContext> DbFactory
+
+<PageTitle>Manage users | Pipeline Portal</PageTitle>
+
+<div class="page-head">
+    <h1>Portal users</h1>
+</div>
+
+@if (_error is not null)
+{
+    <div class="alert-gl alert-gl-error">@_error</div>
+}
+@if (_notice is not null)
+{
+    <div class="alert-gl alert-gl-success">@_notice</div>
+}
+
+<div class="card-surface" style="padding:1rem; margin-bottom:1rem">
+    <h2>Add a user</h2>
+    <div class="form-grid">
+        <div class="form-field">
+            <label for="email">Email</label>
+            <input id="email" type="email" @bind="_newEmail" placeholder="operator@company.com" />
+            <div class="form-hint">Must match the email returned by Okta.</div>
+        </div>
+        <div class="form-field">
+            <label for="display">Display name</label>
+            <input id="display" type="text" @bind="_newDisplayName" />
+        </div>
+        <div class="form-field">
+            <label for="role">Role</label>
+            <select id="role" @bind="_newRole">
+                <option value="@UserRole.Operator">Operator</option>
+                <option value="@UserRole.Admin">Admin</option>
+            </select>
+            <div class="form-hint">Admins manage projects and users, and can act on every project.</div>
+        </div>
+        <div>
+            <button class="btn-gl btn-gl-primary" @onclick="AddUserAsync" disabled="@_busy">Add user</button>
+        </div>
+    </div>
+</div>
+
+<div class="card-surface">
+    <table class="gl-table">
+        <thead>
+            <tr>
+                <th>Email</th>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Last sign-in</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_users.Count == 0)
+            {
+                <tr><td colspan="6" class="empty-state">No user yet.</td></tr>
+            }
+            @foreach (var user in _users)
+            {
+                <tr>
+                    <td><strong>@user.Email</strong></td>
+                    <td class="muted">@(user.DisplayName ?? "-")</td>
+                    <td>
+                        <select @onchange="e => ChangeRoleAsync(user.Id, e.Value?.ToString())" value="@user.Role">
+                            <option value="@UserRole.Operator">Operator</option>
+                            <option value="@UserRole.Admin">Admin</option>
+                        </select>
+                    </td>
+                    <td>
+                        @if (user.IsActive)
+                        {
+                            <StatusBadge Status="success" />
+                        }
+                        else
+                        {
+                            <StatusBadge Status="skipped" />
+                        }
+                    </td>
+                    <td class="muted">@(user.LastLoginUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "never")</td>
+                    <td style="text-align:right; white-space:nowrap">
+                        <button class="btn-gl btn-gl-sm" @onclick="() => TogglePermissions(user.Id)">
+                            @(_permissionsForUserId == user.Id ? "Hide access" : "Project access")
+                        </button>
+                        <button class="btn-gl btn-gl-sm" @onclick="() => ToggleActiveAsync(user.Id)" disabled="@_busy">
+                            @(user.IsActive ? "Disable" : "Enable")
+                        </button>
+                        @if (_confirmDeleteId == user.Id)
+                        {
+                            <button class="btn-gl btn-gl-sm btn-gl-danger" @onclick="() => DeleteUserAsync(user.Id)" disabled="@_busy">Confirm delete</button>
+                            <button class="btn-gl btn-gl-sm" @onclick="() => _confirmDeleteId = null">Keep</button>
+                        }
+                        else
+                        {
+                            <button class="btn-gl btn-gl-sm" @onclick="() => _confirmDeleteId = user.Id">Delete</button>
+                        }
+                    </td>
+                </tr>
+
+                @if (_permissionsForUserId == user.Id)
+                {
+                    <tr>
+                        <td colspan="6" style="background:#fafafb">
+                            @if (user.Role == UserRole.Admin)
+                            {
+                                <div class="alert-gl alert-gl-info" style="margin:0">
+                                    Admins already have full access to every project.
+                                </div>
+                            }
+                            else if (_projects.Count == 0)
+                            {
+                                <div class="muted">No project configured yet.</div>
+                            }
+                            else
+                            {
+                                <table class="gl-table" style="background:transparent">
+                                    <thead>
+                                        <tr><th>Project</th><th>View</th><th>Retry / cancel</th><th>Run new pipeline</th></tr>
+                                    </thead>
+                                    <tbody>
+                                        @foreach (var project in _projects)
+                                        {
+                                            var state = GetPermissionState(user.Id, project.Id);
+                                            <tr>
+                                                <td>@project.Name <span class="muted mono">@project.ProjectId</span></td>
+                                                <td>
+                                                    <input type="checkbox" checked="@state.CanView"
+                                                           @onchange="e => SavePermissionAsync(user.Id, project.Id, view: (bool?)e.Value)" />
+                                                </td>
+                                                <td>
+                                                    <input type="checkbox" checked="@state.CanRetry"
+                                                           @onchange="e => SavePermissionAsync(user.Id, project.Id, retry: (bool?)e.Value)" />
+                                                </td>
+                                                <td>
+                                                    <input type="checkbox" checked="@state.CanRun"
+                                                           @onchange="e => SavePermissionAsync(user.Id, project.Id, run: (bool?)e.Value)" />
+                                                </td>
+                                            </tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            }
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<AppUser> _users = [];
+    private List<GitLabProject> _projects = [];
+    private List<ProjectPermission> _permissions = [];
+
+    private string _newEmail = string.Empty;
+    private string _newDisplayName = string.Empty;
+    private UserRole _newRole = UserRole.Operator;
+
+    private int? _permissionsForUserId;
+    private int? _confirmDeleteId;
+    private bool _busy;
+    private string? _error;
+    private string? _notice;
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _users = await db.AppUsers.AsNoTracking().OrderBy(u => u.Email).ToListAsync();
+        _projects = await db.GitLabProjects.AsNoTracking().OrderBy(p => p.Name).ToListAsync();
+        _permissions = await db.ProjectPermissions.AsNoTracking().ToListAsync();
+    }
+
+    private ProjectPermission GetPermissionState(int userId, int projectId) =>
+        _permissions.FirstOrDefault(p => p.AppUserId == userId && p.GitLabProjectId == projectId)
+        ?? new ProjectPermission { AppUserId = userId, GitLabProjectId = projectId, CanView = false };
+
+    private void TogglePermissions(int userId) =>
+        _permissionsForUserId = _permissionsForUserId == userId ? null : userId;
+
+    private async Task AddUserAsync()
+    {
+        var email = _newEmail.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(email) || !email.Contains('@'))
+        {
+            _error = "Enter a valid email address.";
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+            if (await db.AppUsers.AnyAsync(u => u.Email == email))
+            {
+                _error = "This user already exists.";
+                return;
+            }
+
+            db.AppUsers.Add(new AppUser
+            {
+                Email = email,
+                DisplayName = string.IsNullOrWhiteSpace(_newDisplayName) ? null : _newDisplayName.Trim(),
+                Role = _newRole,
+                IsActive = true
+            });
+            await db.SaveChangesAsync();
+
+            _notice = $"{email} added.";
+            _error = null;
+            _newEmail = string.Empty;
+            _newDisplayName = string.Empty;
+            _newRole = UserRole.Operator;
+            await LoadAsync();
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ChangeRoleAsync(int userId, string? role)
+    {
+        if (!Enum.TryParse<UserRole>(role, out var parsed)) return;
+
+        _busy = true;
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var user = await db.AppUsers.FirstOrDefaultAsync(u => u.Id == userId);
+        if (user is not null)
+        {
+            user.Role = parsed;
+            await db.SaveChangesAsync();
+            _notice = $"{user.Email} is now {parsed}.";
+        }
+        _busy = false;
+        await LoadAsync();
+    }
+
+    private async Task ToggleActiveAsync(int userId)
+    {
+        _busy = true;
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var user = await db.AppUsers.FirstOrDefaultAsync(u => u.Id == userId);
+        if (user is not null)
+        {
+            user.IsActive = !user.IsActive;
+            await db.SaveChangesAsync();
+            _notice = $"{user.Email} is now {(user.IsActive ? "enabled" : "disabled")}.";
+        }
+        _busy = false;
+        await LoadAsync();
+    }
+
+    private async Task DeleteUserAsync(int userId)
+    {
+        _busy = true;
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var user = await db.AppUsers.FirstOrDefaultAsync(u => u.Id == userId);
+        if (user is not null)
+        {
+            db.AppUsers.Remove(user);
+            await db.SaveChangesAsync();
+            _notice = $"{user.Email} removed.";
+        }
+        _confirmDeleteId = null;
+        _permissionsForUserId = null;
+        _busy = false;
+        await LoadAsync();
+    }
+
+    private async Task SavePermissionAsync(int userId, int projectId, bool? view = null, bool? retry = null, bool? run = null)
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var permission = await db.ProjectPermissions
+            .FirstOrDefaultAsync(p => p.AppUserId == userId && p.GitLabProjectId == projectId);
+
+        if (permission is null)
+        {
+            permission = new ProjectPermission { AppUserId = userId, GitLabProjectId = projectId, CanView = false };
+            db.ProjectPermissions.Add(permission);
+        }
+
+        if (view is not null) permission.CanView = view.Value;
+        if (retry is not null) permission.CanRetry = retry.Value;
+        if (run is not null) permission.CanRun = run.Value;
+
+        // Retrying or running implies being able to see the pipelines.
+        if (permission.CanRetry || permission.CanRun) permission.CanView = true;
+
+        if (!permission.CanView && !permission.CanRetry && !permission.CanRun && permission.Id != 0)
+            db.ProjectPermissions.Remove(permission);
+
+        await db.SaveChangesAsync();
+        await LoadAsync();
+    }
+}

@@ -1,0 +1,43 @@
+﻿@inherits LayoutComponentBase
+
+<div class="portal-shell">
+    <header class="portal-header">
+        <a class="portal-brand" href="/">
+            <span class="portal-brand-mark">CI</span>
+            <span>Pipeline Portal</span>
+        </a>
+        <nav class="portal-nav">
+            <NavLink href="" Match="NavLinkMatch.All">Projects</NavLink>
+            <AuthorizeView Policy="AdminOnly">
+                <Authorized>
+                    <NavLink href="admin/projects">Manage projects</NavLink>
+                    <NavLink href="admin/users">Manage users</NavLink>
+                </Authorized>
+            </AuthorizeView>
+        </nav>
+        <div class="portal-user">
+            <AuthorizeView>
+                <Authorized>
+                    <span class="portal-user-name">@(context.User.Identity?.Name ?? "Signed in")</span>
+                    <form action="account/logout" method="post">
+                        <AntiforgeryToken />
+                        <button type="submit" class="portal-signout">Sign out</button>
+                    </form>
+                </Authorized>
+                <NotAuthorized>
+                    <a class="portal-signout" href="account/login">Sign in</a>
+                </NotAuthorized>
+            </AuthorizeView>
+        </div>
+    </header>
+
+    <main class="portal-main">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">🗙</span>
+</div>
