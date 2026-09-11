@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/GitLabPortal/GitLabPortal.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GitLabPortal.Tests/GitLabPortal.Tests.csproj" />
+  </Folder>
 </Solution>
