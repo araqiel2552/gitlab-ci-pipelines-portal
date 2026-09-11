@@ -1,0 +1,264 @@
+@page "/projects/{ProjectId:int}"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject PortalAccessService Access
+@inject GitLabApiService GitLab
+@inject AuthenticationStateProvider AuthStateProvider
+@inject NavigationManager Navigation
+
+<PageTitle>@(_access?.Project.Name ?? "Pipelines") | Pipeline Portal</PageTitle>
+
+@if (_access is null)
+{
+    <div class="card-surface empty-state">
+        @if (_loading)
+        {
+            <span>Loading&hellip;</span>
+        }
+        else
+        {
+            <span>You do not have access to this project.</span>
+        }
+    </div>
+}
+else
+{
+    <div class="breadcrumbs"><a href="">Projects</a> / @_access.Project.Name</div>
+
+    <div class="page-head">
+        <h1>Pipelines</h1>
+        <div style="display:flex; gap:.5rem; align-items:center; flex-wrap:wrap">
+            <select class="btn-gl" @bind="_statusFilter" @bind:after="ReloadAsync">
+                <option value="">All statuses</option>
+                <option value="running">Running</option>
+                <option value="pending">Pending</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="canceled">Canceled</option>
+            </select>
+            <label class="checkbox-row">
+                <input type="checkbox" @bind="_autoRefresh" /> Auto-refresh
+            </label>
+            <button class="btn-gl" @onclick="ReloadAsync" disabled="@_busy">Refresh</button>
+            @if (_access.CanRun)
+            {
+                <button class="btn-gl btn-gl-primary" @onclick="() => _showRunDialog = !_showRunDialog">Run pipeline</button>
+            }
+        </div>
+    </div>
+
+    @if (_error is not null)
+    {
+        <div class="alert-gl alert-gl-error">@_error</div>
+    }
+    @if (_notice is not null)
+    {
+        <div class="alert-gl alert-gl-success">@_notice</div>
+    }
+
+    @if (_showRunDialog && _access.CanRun)
+    {
+        <div class="card-surface" style="padding:1rem; margin-bottom:1rem">
+            <h2>Run a new pipeline</h2>
+            <div class="form-grid">
+                <div class="form-field">
+                    <label for="ref">Branch or tag</label>
+                    @if (_branches.Count > 0)
+                    {
+                        <select id="ref" @bind="_runRef">
+                            @foreach (var branch in _branches)
+                            {
+                                <option value="@branch.Name">@branch.Name</option>
+                            }
+                        </select>
+                    }
+                    else
+                    {
+                        <input id="ref" type="text" @bind="_runRef" />
+                    }
+                    <div class="form-hint">The pipeline runs with the token configured for this project.</div>
+                </div>
+                <div style="display:flex; gap:.5rem">
+                    <button class="btn-gl btn-gl-primary" @onclick="RunPipelineAsync" disabled="@_busy">Start pipeline</button>
+                    <button class="btn-gl" @onclick="() => _showRunDialog = false">Cancel</button>
+                </div>
+            </div>
+        </div>
+    }
+
+    <div class="card-surface">
+        <table class="gl-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Pipeline</th>
+                    <th>Ref</th>
+                    <th>Triggered by</th>
+                    <th>Duration</th>
+                    <th>Created</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (_pipelines.Count == 0)
+                {
+                    <tr><td colspan="7" class="empty-state">No pipelines found.</td></tr>
+                }
+                @foreach (var pipeline in _pipelines)
+                {
+                    <tr>
+                        <td><StatusBadge Status="@pipeline.Status" /></td>
+                        <td>
+                            <a href="@($"projects/{ProjectId}/pipelines/{pipeline.Id}")">#@pipeline.Id</a>
+                            <div class="muted mono">@pipeline.ShortSha</div>
+                        </td>
+                        <td><span class="ref-chip">@pipeline.Ref</span></td>
+                        <td class="muted">@(pipeline.User?.Name ?? pipeline.Source ?? "-")</td>
+                        <td class="muted">@Format.Duration(pipeline.Duration)</td>
+                        <td class="muted" title="@pipeline.CreatedAt?.ToLocalTime().ToString("u")">@Format.Relative(pipeline.CreatedAt)</td>
+                        <td style="text-align:right; white-space:nowrap">
+                            @if (_access.CanRetry && pipeline.Status is "failed" or "canceled" or "success")
+                            {
+                                <button class="btn-gl btn-gl-sm" @onclick="() => RetryPipelineAsync(pipeline.Id)" disabled="@_busy">Retry</button>
+                            }
+                            @if (_access.CanRetry && pipeline.Status is "running" or "pending" or "created")
+                            {
+                                <button class="btn-gl btn-gl-sm btn-gl-danger" @onclick="() => CancelPipelineAsync(pipeline.Id)" disabled="@_busy">Cancel</button>
+                            }
+                            <a class="btn-gl btn-gl-sm" href="@($"projects/{ProjectId}/pipelines/{pipeline.Id}")">Jobs</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    [Parameter] public int ProjectId { get; set; }
+
+    private ProjectAccess? _access;
+    private List<GitLabPipeline> _pipelines = [];
+    private List<GitLabBranch> _branches = [];
+    private string _statusFilter = string.Empty;
+    private string _runRef = string.Empty;
+    private bool _showRunDialog;
+    private bool _autoRefresh = true;
+    private bool _loading = true;
+    private bool _busy;
+    private string? _error;
+    private string? _notice;
+
+    private CancellationTokenSource? _cts;
+    private Task? _refreshLoop;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        var state = await AuthStateProvider.GetAuthenticationStateAsync();
+        _access = await Access.GetProjectAccessAsync(state.User, ProjectId);
+        _loading = false;
+
+        if (_access is null) return;
+
+        _runRef = string.IsNullOrWhiteSpace(_runRef) ? _access.Project.DefaultRef : _runRef;
+        await ReloadAsync();
+
+        if (_access.CanRun && _branches.Count == 0)
+        {
+            var branches = await GitLab.GetBranchesAsync(_access.Project);
+            if (branches.Success && branches.Value is not null) _branches = branches.Value;
+        }
+
+        _refreshLoop ??= StartAutoRefresh();
+    }
+
+    private Task StartAutoRefresh()
+    {
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+        return Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                if (!_autoRefresh || _busy) continue;
+                await InvokeAsync(async () =>
+                {
+                    await ReloadAsync();
+                    StateHasChanged();
+                });
+            }
+        }, token);
+    }
+
+    private async Task ReloadAsync()
+    {
+        if (_access is null) return;
+
+        var result = await GitLab.GetPipelinesAsync(_access.Project, status: string.IsNullOrEmpty(_statusFilter) ? null : _statusFilter);
+        if (result.Success && result.Value is not null)
+        {
+            _pipelines = result.Value;
+            _error = null;
+        }
+        else
+        {
+            _error = result.Error;
+        }
+    }
+
+    private async Task RunPipelineAsync()
+    {
+        if (_access is not { CanRun: true } || string.IsNullOrWhiteSpace(_runRef)) return;
+
+        _busy = true;
+        _notice = null;
+        var result = await GitLab.CreatePipelineAsync(_access.Project, _runRef.Trim());
+        _busy = false;
+
+        if (result.Success && result.Value is not null)
+        {
+            _notice = $"Pipeline #{result.Value.Id} started on {_runRef}.";
+            _showRunDialog = false;
+            await ReloadAsync();
+        }
+        else
+        {
+            _error = result.Error;
+        }
+    }
+
+    private async Task RetryPipelineAsync(long pipelineId)
+    {
+        if (_access is not { CanRetry: true }) return;
+
+        _busy = true;
+        var result = await GitLab.RetryPipelineAsync(_access.Project, pipelineId);
+        _busy = false;
+
+        if (result.Success) { _notice = $"Pipeline #{pipelineId} retried."; await ReloadAsync(); }
+        else _error = result.Error;
+    }
+
+    private async Task CancelPipelineAsync(long pipelineId)
+    {
+        if (_access is not { CanRetry: true }) return;
+
+        _busy = true;
+        var result = await GitLab.CancelPipelineAsync(_access.Project, pipelineId);
+        _busy = false;
+
+        if (result.Success) { _notice = $"Pipeline #{pipelineId} canceled."; await ReloadAsync(); }
+        else _error = result.Error;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_cts is not null)
+        {
+            await _cts.CancelAsync();
+            _cts.Dispose();
+        }
+    }
+}

@@ -427,3 +427,8 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# GitLab Portal local data
+*.db
+*.db-shm
+*.db-wal

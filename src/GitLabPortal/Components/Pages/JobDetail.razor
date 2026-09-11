@@ -1,0 +1,241 @@
+@page "/projects/{ProjectId:int}/jobs/{JobId:long}"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject PortalAccessService Access
+@inject GitLabApiService GitLab
+@inject AuthenticationStateProvider AuthStateProvider
+@inject IJSRuntime JS
+
+<PageTitle>Job #@JobId | Pipeline Portal</PageTitle>
+
+@if (_access is null)
+{
+    <div class="card-surface empty-state">
+        @(_loading ? "Loading…" : "You do not have access to this project.")
+    </div>
+}
+else
+{
+    <div class="breadcrumbs">
+        <a href="">Projects</a> /
+        <a href="@($"projects/{ProjectId}")">@_access.Project.Name</a> /
+        @if (_pipelineId > 0)
+        {
+            <a href="@($"projects/{ProjectId}/pipelines/{_pipelineId}")">Pipeline</a>
+            @: /
+        }
+        Job #@JobId
+    </div>
+
+    <div class="page-head">
+        <div style="display:flex; align-items:center; gap:.75rem; flex-wrap:wrap">
+            <h1>@(_job?.Name ?? $"Job #{JobId}")</h1>
+            @if (_job is not null)
+            {
+                <StatusBadge Status="@_job.Status" />
+                <span class="ref-chip">@_job.Stage</span>
+                <span class="ref-chip">@_job.Ref</span>
+            }
+        </div>
+        <div style="display:flex; gap:.5rem; align-items:center; flex-wrap:wrap">
+            <label class="checkbox-row"><input type="checkbox" @bind="_follow" /> Follow log</label>
+            <button class="btn-gl" @onclick="ReloadAsync" disabled="@_busy">Refresh</button>
+            @if (_job?.HasArtifacts == true)
+            {
+                <a class="btn-gl btn-gl-primary" href="@($"projects/{ProjectId}/jobs/{JobId}/artifacts")">Download artifacts</a>
+            }
+            @if (_access.CanRun && _job?.Status == "manual")
+            {
+                <button class="btn-gl btn-gl-primary" @onclick="PlayJobAsync" disabled="@_busy">Run job</button>
+            }
+            else if (_access.CanRetry && _job is not null && _job.Status is "failed" or "canceled" or "success")
+            {
+                <button class="btn-gl" @onclick="RetryJobAsync" disabled="@_busy">Retry job</button>
+            }
+            else if (_access.CanRetry && _job is not null && _job.Status is "running" or "pending")
+            {
+                <button class="btn-gl btn-gl-danger" @onclick="CancelJobAsync" disabled="@_busy">Cancel job</button>
+            }
+        </div>
+    </div>
+
+    @if (_error is not null)
+    {
+        <div class="alert-gl alert-gl-error">@_error</div>
+    }
+    @if (_notice is not null)
+    {
+        <div class="alert-gl alert-gl-success">@_notice</div>
+    }
+
+    @if (_job is not null)
+    {
+        <div class="card-surface" style="padding:1rem; margin-bottom:1rem; display:flex; gap:2rem; flex-wrap:wrap">
+            <div><div class="stage-title">Duration</div>@Format.Duration(_job.Duration)</div>
+            <div><div class="stage-title">Queued</div>@Format.Duration(_job.QueuedDuration)</div>
+            <div><div class="stage-title">Started</div>@Format.Relative(_job.StartedAt)</div>
+            <div><div class="stage-title">Finished</div>@Format.Relative(_job.FinishedAt)</div>
+            <div><div class="stage-title">Commit</div><span class="mono">@(_job.Commit?.ShortId ?? "-")</span></div>
+            @if (_job.FailureReason is not null)
+            {
+                <div><div class="stage-title">Failure reason</div>@_job.FailureReason</div>
+            }
+        </div>
+
+        @if (_job.Artifacts.Count > 0 || _job.ArtifactsFile is not null)
+        {
+            <div class="card-surface" style="padding:1rem; margin-bottom:1rem">
+                <h2>Artifacts</h2>
+                <table class="gl-table">
+                    <thead><tr><th>File</th><th>Type</th><th>Size</th><th></th></tr></thead>
+                    <tbody>
+                        @foreach (var artifact in ArtifactList)
+                        {
+                            <tr>
+                                <td class="mono">@(artifact.Filename ?? "-")</td>
+                                <td class="muted">@(artifact.FileType ?? "-")</td>
+                                <td class="muted">@Format.Bytes(artifact.Size)</td>
+                                <td style="text-align:right">
+                                    @if (artifact.FileType is "archive" or null)
+                                    {
+                                        <a class="btn-gl btn-gl-sm" href="@($"projects/{ProjectId}/jobs/{JobId}/artifacts")">Download</a>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    }
+
+    <div class="terminal-toolbar">
+        <h2>Job log</h2>
+        <span class="muted">@(_log.Length == 0 ? "No output yet" : $"{_log.Split('\n').Length} lines")</span>
+    </div>
+    <pre id="job-log" class="terminal-box">@(_log.Length == 0 ? "Waiting for output…" : _log)</pre>
+}
+
+@code {
+    [Parameter] public int ProjectId { get; set; }
+    [Parameter] public long JobId { get; set; }
+
+    private ProjectAccess? _access;
+    private GitLabJob? _job;
+    private string _log = string.Empty;
+    private long _pipelineId;
+    private bool _follow = true;
+    private bool _loading = true;
+    private bool _busy;
+    private string? _error;
+    private string? _notice;
+    private bool _shouldScroll;
+
+    private CancellationTokenSource? _cts;
+    private Task? _refreshLoop;
+
+    private IEnumerable<GitLabArtifact> ArtifactList =>
+        _job is null
+            ? []
+            : _job.Artifacts.Count > 0 ? _job.Artifacts : [_job.ArtifactsFile!];
+
+    protected override async Task OnParametersSetAsync()
+    {
+        var state = await AuthStateProvider.GetAuthenticationStateAsync();
+        _access = await Access.GetProjectAccessAsync(state.User, ProjectId);
+        _loading = false;
+        if (_access is null) return;
+
+        await ReloadAsync();
+        _refreshLoop ??= StartAutoRefresh();
+    }
+
+    private Task StartAutoRefresh()
+    {
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+        return Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                if (_busy || _job?.Status is "success" or "failed" or "canceled" or "skipped" or "manual") continue;
+                await InvokeAsync(async () =>
+                {
+                    await ReloadAsync();
+                    StateHasChanged();
+                });
+            }
+        }, token);
+    }
+
+    private async Task ReloadAsync()
+    {
+        if (_access is null) return;
+
+        var job = await GitLab.GetJobAsync(_access.Project, JobId);
+        if (job.Success && job.Value is not null)
+        {
+            _job = job.Value;
+            _pipelineId = job.Value.Pipeline?.Id ?? _pipelineId;
+            _error = null;
+        }
+        else
+        {
+            _error = job.Error;
+        }
+
+        var log = await GitLab.GetJobLogAsync(_access.Project, JobId);
+        if (log.Success)
+        {
+            var text = log.Value ?? string.Empty;
+            _shouldScroll = _follow && text.Length != _log.Length;
+            _log = text;
+        }
+        else
+        {
+            _error ??= log.Error;
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_shouldScroll)
+        {
+            _shouldScroll = false;
+            await JS.InvokeVoidAsync("portal.scrollToBottom", "job-log");
+        }
+    }
+
+    private async Task RetryJobAsync() => await RunActionAsync(
+        () => GitLab.RetryJobAsync(_access!.Project, JobId), "Job retried.");
+
+    private async Task CancelJobAsync() => await RunActionAsync(
+        () => GitLab.CancelJobAsync(_access!.Project, JobId), "Job canceled.");
+
+    private async Task PlayJobAsync() => await RunActionAsync(
+        () => GitLab.PlayJobAsync(_access!.Project, JobId), "Job started.");
+
+    private async Task RunActionAsync(Func<Task<GitLabResult<GitLabJob>>> action, string successMessage)
+    {
+        if (_access is null) return;
+
+        _busy = true;
+        _notice = null;
+        var result = await action();
+        _busy = false;
+
+        if (result.Success) { _notice = successMessage; await ReloadAsync(); }
+        else _error = result.Error;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_cts is not null)
+        {
+            await _cts.CancelAsync();
+            _cts.Dispose();
+        }
+    }
+}

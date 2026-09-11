@@ -1,0 +1,227 @@
+@page "/projects/{ProjectId:int}/pipelines/{PipelineId:long}"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject PortalAccessService Access
+@inject GitLabApiService GitLab
+@inject AuthenticationStateProvider AuthStateProvider
+
+<PageTitle>Pipeline #@PipelineId | Pipeline Portal</PageTitle>
+
+@if (_access is null)
+{
+    <div class="card-surface empty-state">
+        @(_loading ? "Loading…" : "You do not have access to this project.")
+    </div>
+}
+else
+{
+    <div class="breadcrumbs">
+        <a href="">Projects</a> /
+        <a href="@($"projects/{ProjectId}")">@_access.Project.Name</a> /
+        Pipeline #@PipelineId
+    </div>
+
+    <div class="page-head">
+        <div style="display:flex; align-items:center; gap:.75rem; flex-wrap:wrap">
+            <h1>Pipeline #@PipelineId</h1>
+            @if (_pipeline is not null)
+            {
+                <StatusBadge Status="@_pipeline.Status" />
+                <span class="ref-chip">@_pipeline.Ref</span>
+                <span class="muted mono">@_pipeline.ShortSha</span>
+            }
+        </div>
+        <div style="display:flex; gap:.5rem; align-items:center; flex-wrap:wrap">
+            <label class="checkbox-row"><input type="checkbox" @bind="_autoRefresh" /> Auto-refresh</label>
+            <button class="btn-gl" @onclick="ReloadAsync" disabled="@_busy">Refresh</button>
+            @if (_access.CanRetry && _pipeline is not null)
+            {
+                @if (_pipeline.Status is "running" or "pending" or "created")
+                {
+                    <button class="btn-gl btn-gl-danger" @onclick="CancelPipelineAsync" disabled="@_busy">Cancel pipeline</button>
+                }
+                else
+                {
+                    <button class="btn-gl btn-gl-primary" @onclick="RetryPipelineAsync" disabled="@_busy">Retry pipeline</button>
+                }
+            }
+        </div>
+    </div>
+
+    @if (_error is not null)
+    {
+        <div class="alert-gl alert-gl-error">@_error</div>
+    }
+    @if (_notice is not null)
+    {
+        <div class="alert-gl alert-gl-success">@_notice</div>
+    }
+
+    @if (_pipeline is not null)
+    {
+        <div class="card-surface" style="padding:1rem; margin-bottom:1rem; display:flex; gap:2rem; flex-wrap:wrap">
+            <div><div class="stage-title">Triggered by</div>@(_pipeline.User?.Name ?? _pipeline.Source ?? "-")</div>
+            <div><div class="stage-title">Source</div>@(_pipeline.Source ?? "-")</div>
+            <div><div class="stage-title">Duration</div>@Format.Duration(_pipeline.Duration)</div>
+            <div><div class="stage-title">Created</div>@Format.Relative(_pipeline.CreatedAt)</div>
+            <div><div class="stage-title">Finished</div>@Format.Relative(_pipeline.FinishedAt)</div>
+        </div>
+    }
+
+    <div class="card-surface">
+        @if (_stages.Count == 0)
+        {
+            <div class="empty-state">No jobs in this pipeline yet.</div>
+        }
+        else
+        {
+            <div class="stage-graph">
+                @foreach (var stage in _stages)
+                {
+                    <div class="stage-column">
+                        <div class="stage-title">@stage.Key (@stage.Count())</div>
+                        @foreach (var job in stage)
+                        {
+                            <div class="job-card">
+                                <div class="job-card-name">
+                                    <StatusBadge Status="@job.Status" />
+                                    <a href="@($"projects/{ProjectId}/jobs/{job.Id}")" title="@job.Name">@job.Name</a>
+                                </div>
+                                <div class="job-card-actions">
+                                    @if (job.HasArtifacts)
+                                    {
+                                        <a class="btn-gl btn-gl-sm"
+                                           href="@($"projects/{ProjectId}/jobs/{job.Id}/artifacts")"
+                                           title="Download artifacts">&#8681;</a>
+                                    }
+                                    @if (_access.CanRun && job.Status == "manual")
+                                    {
+                                        <button class="btn-gl btn-gl-sm" title="Play job"
+                                                @onclick="() => PlayJobAsync(job.Id)" disabled="@_busy">&#9654;</button>
+                                    }
+                                    else if (_access.CanRetry && job.Status is "failed" or "canceled" or "success")
+                                    {
+                                        <button class="btn-gl btn-gl-sm" title="Retry job"
+                                                @onclick="() => RetryJobAsync(job.Id)" disabled="@_busy">&#8635;</button>
+                                    }
+                                    else if (_access.CanRetry && job.Status is "running" or "pending")
+                                    {
+                                        <button class="btn-gl btn-gl-sm" title="Cancel job"
+                                                @onclick="() => CancelJobAsync(job.Id)" disabled="@_busy">&#10005;</button>
+                                    }
+                                </div>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public int ProjectId { get; set; }
+    [Parameter] public long PipelineId { get; set; }
+
+    private ProjectAccess? _access;
+    private GitLabPipeline? _pipeline;
+    private List<IGrouping<string, GitLabJob>> _stages = [];
+    private bool _autoRefresh = true;
+    private bool _loading = true;
+    private bool _busy;
+    private string? _error;
+    private string? _notice;
+
+    private CancellationTokenSource? _cts;
+    private Task? _refreshLoop;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        var state = await AuthStateProvider.GetAuthenticationStateAsync();
+        _access = await Access.GetProjectAccessAsync(state.User, ProjectId);
+        _loading = false;
+        if (_access is null) return;
+
+        await ReloadAsync();
+        _refreshLoop ??= StartAutoRefresh();
+    }
+
+    private Task StartAutoRefresh()
+    {
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+        return Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(8));
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                if (!_autoRefresh || _busy) continue;
+                await InvokeAsync(async () =>
+                {
+                    await ReloadAsync();
+                    StateHasChanged();
+                });
+            }
+        }, token);
+    }
+
+    private async Task ReloadAsync()
+    {
+        if (_access is null) return;
+
+        var pipeline = await GitLab.GetPipelineAsync(_access.Project, PipelineId);
+        if (pipeline.Success) _pipeline = pipeline.Value;
+        else _error = pipeline.Error;
+
+        var jobs = await GitLab.GetPipelineJobsAsync(_access.Project, PipelineId);
+        if (jobs.Success && jobs.Value is not null)
+        {
+            _stages = [.. jobs.Value
+                .OrderBy(j => j.Id)
+                .GroupBy(j => j.Stage)];
+            _error = null;
+        }
+        else
+        {
+            _error = jobs.Error;
+        }
+    }
+
+    private async Task RetryPipelineAsync() => await RunActionAsync(
+        () => GitLab.RetryPipelineAsync(_access!.Project, PipelineId), "Pipeline retried.");
+
+    private async Task CancelPipelineAsync() => await RunActionAsync(
+        () => GitLab.CancelPipelineAsync(_access!.Project, PipelineId), "Pipeline canceled.");
+
+    private async Task RetryJobAsync(long jobId) => await RunActionAsync(
+        () => GitLab.RetryJobAsync(_access!.Project, jobId), $"Job #{jobId} retried.");
+
+    private async Task CancelJobAsync(long jobId) => await RunActionAsync(
+        () => GitLab.CancelJobAsync(_access!.Project, jobId), $"Job #{jobId} canceled.");
+
+    private async Task PlayJobAsync(long jobId) => await RunActionAsync(
+        () => GitLab.PlayJobAsync(_access!.Project, jobId), $"Job #{jobId} started.");
+
+    private async Task RunActionAsync<T>(Func<Task<GitLabResult<T>>> action, string successMessage)
+    {
+        if (_access is null) return;
+
+        _busy = true;
+        _notice = null;
+        var result = await action();
+        _busy = false;
+
+        if (result.Success) { _notice = successMessage; await ReloadAsync(); }
+        else _error = result.Error;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_cts is not null)
+        {
+            await _cts.CancelAsync();
+            _cts.Dispose();
+        }
+    }
+}

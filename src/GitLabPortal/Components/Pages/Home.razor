@@ -1,0 +1,85 @@
+﻿@page "/"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inject PortalAccessService Access
+@inject AuthenticationStateProvider AuthStateProvider
+
+<PageTitle>Projects | Pipeline Portal</PageTitle>
+
+<div class="page-head">
+    <h1>Projects</h1>
+</div>
+
+@if (_loading)
+{
+    <div class="empty-state">Loading your projects&hellip;</div>
+}
+else if (_projects.Count == 0)
+{
+    <div class="card-surface empty-state">
+        <p>No GitLab project has been shared with your account yet.</p>
+        <AuthorizeView Policy="AdminOnly">
+            <Authorized>
+                <a class="btn-gl btn-gl-primary" href="admin/projects">Configure a project</a>
+            </Authorized>
+            <NotAuthorized>
+                <p class="muted">Ask a portal administrator to grant you access.</p>
+            </NotAuthorized>
+        </AuthorizeView>
+    </div>
+}
+else
+{
+    <div class="card-surface">
+        <table class="gl-table">
+            <thead>
+                <tr>
+                    <th>Project</th>
+                    <th>GitLab instance</th>
+                    <th>Default branch</th>
+                    <th>Your permissions</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var access in _projects)
+                {
+                    <tr>
+                        <td>
+                            <a href="@($"projects/{access.Project.Id}")"><strong>@access.Project.Name</strong></a>
+                            <div class="muted mono">@access.Project.ProjectId</div>
+                        </td>
+                        <td class="muted">@access.Project.GitLabUrl</td>
+                        <td><span class="ref-chip">@access.Project.DefaultRef</span></td>
+                        <td>
+                            <span class="ref-chip">view</span>
+                            @if (access.CanRetry)
+                            {
+                                <span class="ref-chip">retry</span>
+                            }
+                            @if (access.CanRun)
+                            {
+                                <span class="ref-chip">run</span>
+                            }
+                        </td>
+                        <td style="text-align:right">
+                            <a class="btn-gl btn-gl-sm" href="@($"projects/{access.Project.Id}")">Pipelines</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private List<ProjectAccess> _projects = [];
+    private bool _loading = true;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthStateProvider.GetAuthenticationStateAsync();
+        _projects = await Access.GetAccessibleProjectsAsync(state.User);
+        _loading = false;
+    }
+}

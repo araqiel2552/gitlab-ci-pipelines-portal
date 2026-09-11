@@ -1,0 +1,36 @@
+@* GitLab-like colored status pill used for pipelines and jobs. *@
+<span class="gl-badge gl-badge-@StatusClass" title="@Status">
+    <span class="gl-badge-icon">@Icon</span>
+    <span>@Status</span>
+</span>
+
+@code {
+    [Parameter, EditorRequired] public string Status { get; set; } = "unknown";
+
+    private string StatusClass => Status switch
+    {
+        "success" => "success",
+        "failed" => "failed",
+        "running" => "running",
+        "pending" or "waiting_for_resource" or "preparing" => "pending",
+        "canceled" or "canceling" => "canceled",
+        "skipped" => "skipped",
+        "manual" => "manual",
+        "scheduled" => "scheduled",
+        "created" => "created",
+        _ => "unknown"
+    };
+
+    private string Icon => Status switch
+    {
+        "success" => "\u2713",
+        "failed" => "\u2715",
+        "running" => "\u25D4",
+        "pending" or "waiting_for_resource" or "preparing" => "\u23F8",
+        "canceled" or "canceling" => "\u2298",
+        "skipped" => "\u00BB",
+        "manual" => "\u2699",
+        "scheduled" => "\u23F1",
+        _ => "\u25CB"
+    };
+}

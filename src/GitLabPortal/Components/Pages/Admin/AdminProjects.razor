@@ -1,0 +1,276 @@
+@page "/admin/projects"
+@attribute [Authorize(Policy = "AdminOnly")]
+@rendermode InteractiveServer
+@inject IDbContextFactory<AppDbContext> DbFactory
+@inject ITokenProtector TokenProtector
+@inject GitLabApiService GitLab
+
+<PageTitle>Manage projects | Pipeline Portal</PageTitle>
+
+<div class="page-head">
+    <h1>GitLab projects</h1>
+    <button class="btn-gl btn-gl-primary" @onclick="() => StartEdit(null)">Add project</button>
+</div>
+
+@if (_error is not null)
+{
+    <div class="alert-gl alert-gl-error">@_error</div>
+}
+@if (_notice is not null)
+{
+    <div class="alert-gl alert-gl-success">@_notice</div>
+}
+
+@if (_editing is not null)
+{
+    <div class="card-surface" style="padding:1rem; margin-bottom:1rem">
+        <h2>@(_editing.Id == 0 ? "Add project" : $"Edit {_editing.Name}")</h2>
+        <div class="form-grid">
+            <div class="form-field">
+                <label for="name">Display name</label>
+                <input id="name" type="text" @bind="_editing.Name" />
+            </div>
+            <div class="form-field">
+                <label for="url">GitLab URL</label>
+                <input id="url" type="text" @bind="_editing.GitLabUrl" placeholder="https://gitlab.com" />
+            </div>
+            <div class="form-field">
+                <label for="pid">Project id or path</label>
+                <input id="pid" type="text" @bind="_editing.ProjectId" placeholder="1234 or group/subgroup/project" />
+                <div class="form-hint">Numeric id, or the full path; it is URL-encoded automatically.</div>
+            </div>
+            <div class="form-field">
+                <label for="token">Access token</label>
+                <input id="token" type="password" @bind="_token" autocomplete="new-password"
+                       placeholder="@(_editing.Id == 0 ? "glpat-…" : "Leave blank to keep the current token")" />
+                <div class="form-hint">Project or personal access token with the <span class="mono">api</span> scope. Stored encrypted.</div>
+            </div>
+            <div class="form-field">
+                <label for="ref">Default branch</label>
+                <input id="ref" type="text" @bind="_editing.DefaultRef" />
+            </div>
+            <label class="checkbox-row">
+                <input type="checkbox" @bind="_editing.IsActive" /> Active
+            </label>
+            <div style="display:flex; gap:.5rem">
+                <button class="btn-gl btn-gl-primary" @onclick="SaveAsync" disabled="@_busy">Save</button>
+                <button class="btn-gl" @onclick="TestConnectionAsync" disabled="@_busy">Test connection</button>
+                <button class="btn-gl" @onclick="CancelEdit">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+<div class="card-surface">
+    <table class="gl-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>GitLab URL</th>
+                <th>Project</th>
+                <th>Default branch</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_projects.Count == 0)
+            {
+                <tr><td colspan="6" class="empty-state">No project configured yet.</td></tr>
+            }
+            @foreach (var project in _projects)
+            {
+                <tr>
+                    <td><strong>@project.Name</strong></td>
+                    <td class="muted">@project.GitLabUrl</td>
+                    <td class="mono">@project.ProjectId</td>
+                    <td><span class="ref-chip">@project.DefaultRef</span></td>
+                    <td>
+                        @if (project.IsActive)
+                        {
+                            <StatusBadge Status="success" />
+                        }
+                        else
+                        {
+                            <StatusBadge Status="skipped" />
+                        }
+                    </td>
+                    <td style="text-align:right; white-space:nowrap">
+                        <button class="btn-gl btn-gl-sm" @onclick="() => StartEdit(project)">Edit</button>
+                        @if (_confirmDeleteId == project.Id)
+                        {
+                            <button class="btn-gl btn-gl-sm btn-gl-danger" @onclick="() => DeleteAsync(project.Id)" disabled="@_busy">Confirm delete</button>
+                            <button class="btn-gl btn-gl-sm" @onclick="() => _confirmDeleteId = null">Keep</button>
+                        }
+                        else
+                        {
+                            <button class="btn-gl btn-gl-sm" @onclick="() => _confirmDeleteId = project.Id">Delete</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<GitLabProject> _projects = [];
+    private GitLabProject? _editing;
+    private string _token = string.Empty;
+    private int? _confirmDeleteId;
+    private bool _busy;
+    private string? _error;
+    private string? _notice;
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _projects = await db.GitLabProjects.AsNoTracking().OrderBy(p => p.Name).ToListAsync();
+    }
+
+    private void StartEdit(GitLabProject? project)
+    {
+        _error = null;
+        _notice = null;
+        _token = string.Empty;
+        _editing = project is null
+            ? new GitLabProject()
+            : new GitLabProject
+            {
+                Id = project.Id,
+                Name = project.Name,
+                GitLabUrl = project.GitLabUrl,
+                ProjectId = project.ProjectId,
+                DefaultRef = project.DefaultRef,
+                IsActive = project.IsActive,
+                AccessTokenProtected = project.AccessTokenProtected
+            };
+    }
+
+    private void CancelEdit()
+    {
+        _editing = null;
+        _token = string.Empty;
+    }
+
+    private async Task TestConnectionAsync()
+    {
+        if (_editing is null) return;
+
+        var token = _token;
+        if (string.IsNullOrWhiteSpace(token) && _editing.Id != 0)
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var stored = await db.GitLabProjects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == _editing.Id);
+            if (stored is not null) TokenProtector.TryUnprotect(stored.AccessTokenProtected, out token);
+        }
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            _error = "Provide an access token to test the connection.";
+            return;
+        }
+
+        _busy = true;
+        var result = await GitLab.TestConnectionAsync(_editing.GitLabUrl, _editing.ProjectId, token);
+        _busy = false;
+
+        if (result.Success)
+        {
+            _notice = $"Connected to {result.Value}.";
+            _error = null;
+        }
+        else
+        {
+            _error = result.Error;
+            _notice = null;
+        }
+    }
+
+    private async Task SaveAsync()
+    {
+        if (_editing is null) return;
+
+        if (string.IsNullOrWhiteSpace(_editing.Name) ||
+            string.IsNullOrWhiteSpace(_editing.GitLabUrl) ||
+            string.IsNullOrWhiteSpace(_editing.ProjectId))
+        {
+            _error = "Name, GitLab URL and project id are required.";
+            return;
+        }
+
+        if (_editing.Id == 0 && string.IsNullOrWhiteSpace(_token))
+        {
+            _error = "An access token is required for a new project.";
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+
+            if (_editing.Id == 0)
+            {
+                db.GitLabProjects.Add(new GitLabProject
+                {
+                    Name = _editing.Name.Trim(),
+                    GitLabUrl = _editing.GitLabUrl.Trim().TrimEnd('/'),
+                    ProjectId = _editing.ProjectId.Trim(),
+                    DefaultRef = string.IsNullOrWhiteSpace(_editing.DefaultRef) ? "main" : _editing.DefaultRef.Trim(),
+                    IsActive = _editing.IsActive,
+                    AccessTokenProtected = TokenProtector.Protect(_token)
+                });
+            }
+            else
+            {
+                var existing = await db.GitLabProjects.FirstOrDefaultAsync(p => p.Id == _editing.Id);
+                if (existing is null)
+                {
+                    _error = "The project no longer exists.";
+                    return;
+                }
+
+                existing.Name = _editing.Name.Trim();
+                existing.GitLabUrl = _editing.GitLabUrl.Trim().TrimEnd('/');
+                existing.ProjectId = _editing.ProjectId.Trim();
+                existing.DefaultRef = string.IsNullOrWhiteSpace(_editing.DefaultRef) ? "main" : _editing.DefaultRef.Trim();
+                existing.IsActive = _editing.IsActive;
+                if (!string.IsNullOrWhiteSpace(_token))
+                    existing.AccessTokenProtected = TokenProtector.Protect(_token);
+            }
+
+            await db.SaveChangesAsync();
+            _notice = "Project saved.";
+            _error = null;
+            CancelEdit();
+            await LoadAsync();
+        }
+        catch (DbUpdateException)
+        {
+            _error = "Another entry already uses this GitLab URL and project id.";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DeleteAsync(int id)
+    {
+        _busy = true;
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var project = await db.GitLabProjects.FirstOrDefaultAsync(p => p.Id == id);
+        if (project is not null)
+        {
+            db.GitLabProjects.Remove(project);
+            await db.SaveChangesAsync();
+            _notice = $"Project {project.Name} removed.";
+        }
+        _confirmDeleteId = null;
+        _busy = false;
+        await LoadAsync();
+    }
+}
